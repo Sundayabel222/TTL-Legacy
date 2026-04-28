@@ -1,8 +1,10 @@
 use crate::models::*;
 use crate::db::*;
+use crate::notifications::NotificationService;
 use chrono::Utc;
 use serde_json::json;
 use std::io::Write;
+use std::sync::Arc;
 
 pub fn search_vaults_handler(
     store: &VaultStore,
@@ -284,6 +286,51 @@ pub fn create_vault_from_template(
     Ok(vault)
 }
 
+// ── Push notification HTTP handlers ─────────────────────────────────────────
+
+/// POST /notifications/register
+/// Register a device push token for an owner.
+pub fn register_push_token_handler(
+    svc: &NotificationService,
+    req: RegisterTokenRequest,
+) {
+    svc.register_token(req);
+}
+
+/// DELETE /notifications/register
+/// Unregister a device push token.
+pub fn unregister_push_token_handler(
+    svc: &NotificationService,
+    owner: &str,
+    token: &str,
+) {
+    svc.unregister_token(owner, token);
+}
+
+/// GET /notifications/preferences?owner=…
+pub fn get_preferences_handler(
+    svc: &NotificationService,
+    owner: &str,
+) -> NotificationPreferences {
+    svc.get_preferences(owner)
+}
+
+/// PUT /notifications/preferences
+pub fn update_preferences_handler(
+    svc: &NotificationService,
+    req: UpdatePreferencesRequest,
+) {
+    svc.update_preferences(req);
+}
+
+/// GET /notifications/delivery?owner=…
+pub fn get_delivery_log_handler(
+    svc: &NotificationService,
+    owner: &str,
+) -> Vec<DeliveryRecord> {
+    svc.get_delivery_log(owner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +514,71 @@ mod tests {
         let pdf_str = result.unwrap();
         assert!(pdf_str.contains("COMPLIANCE REPORT"));
         assert!(pdf_str.contains("v1"));
+    }
+
+    // ── Notification handler tests ───────────────────────────────────────────
+
+    fn make_notification_service() -> NotificationService {
+        use crate::notifications::*;
+        use std::sync::Arc;
+        NotificationService::new(
+            Arc::new(FcmClient::new("key".into(), "proj".into())),
+            create_token_store(),
+            create_prefs_store(),
+            create_schedule_store(),
+            create_delivery_store(),
+        )
+    }
+
+    #[test]
+    fn test_register_push_token_handler() {
+        let svc = make_notification_service();
+        register_push_token_handler(&svc, RegisterTokenRequest {
+            owner: "owner1".into(),
+            token: "tok-xyz".into(),
+            platform: "android".into(),
+        });
+        assert_eq!(svc.get_tokens("owner1").len(), 1);
+    }
+
+    #[test]
+    fn test_unregister_push_token_handler() {
+        let svc = make_notification_service();
+        register_push_token_handler(&svc, RegisterTokenRequest {
+            owner: "owner1".into(),
+            token: "tok-xyz".into(),
+            platform: "ios".into(),
+        });
+        unregister_push_token_handler(&svc, "owner1", "tok-xyz");
+        assert!(svc.get_tokens("owner1").is_empty());
+    }
+
+    #[test]
+    fn test_get_preferences_handler_returns_defaults() {
+        let svc = make_notification_service();
+        let prefs = get_preferences_handler(&svc, "owner1");
+        assert!(prefs.expiry_warning_enabled);
+        assert_eq!(prefs.warning_hours_before, 24);
+    }
+
+    #[test]
+    fn test_update_preferences_handler() {
+        let svc = make_notification_service();
+        update_preferences_handler(&svc, UpdatePreferencesRequest {
+            owner: "owner1".into(),
+            expiry_warning_enabled: Some(false),
+            check_in_reminder_enabled: None,
+            vault_released_enabled: None,
+            warning_hours_before: Some(12),
+        });
+        let prefs = get_preferences_handler(&svc, "owner1");
+        assert!(!prefs.expiry_warning_enabled);
+        assert_eq!(prefs.warning_hours_before, 12);
+    }
+
+    #[test]
+    fn test_get_delivery_log_handler_empty() {
+        let svc = make_notification_service();
+        assert!(get_delivery_log_handler(&svc, "owner1").is_empty());
     }
 }
