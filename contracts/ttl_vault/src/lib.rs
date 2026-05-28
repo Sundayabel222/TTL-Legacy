@@ -1211,6 +1211,30 @@ impl TtlVaultContract {
             }
         }
 
+        // Apply scheduled beneficiary rotation if effective timestamp has passed
+        let rot_key = DataKey::BeneficiaryRotationSchedule(vault_id);
+        if let Some(mut schedule) = env.storage().persistent()
+            .get::<DataKey, Vec<BeneficiaryRotationEntry>>(&rot_key)
+        {
+            // Find the latest entry whose effective_timestamp <= now
+            let mut applied: Option<BeneficiaryRotationEntry> = None;
+            for entry in schedule.iter() {
+                if entry.effective_timestamp <= now {
+                    if applied.as_ref().map_or(true, |a: &BeneficiaryRotationEntry| entry.effective_timestamp > a.effective_timestamp) {
+                        applied = Some(entry.clone());
+                    }
+                }
+            }
+            if let Some(rotation) = applied {
+                if rotation.new_beneficiaries.is_empty() {
+                    // single-beneficiary rotation not supported via this path; skip
+                } else {
+                    vault.beneficiaries = rotation.new_beneficiaries.clone();
+                }
+                env.events().publish((BEN_ROTATION_TOPIC, vault_id), rotation.effective_timestamp);
+            }
+        }
+
         // Check if a vesting schedule is attached
         let has_vesting = env
             .storage()

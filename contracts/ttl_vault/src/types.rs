@@ -104,6 +104,13 @@ pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 // Issue: Accelerated TTL Decay
 pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 
+// Emergency freeze events
+pub const EMERGENCY_FREEZE_TOPIC: Symbol = symbol_short!("emg_frz");
+pub const FREEZE_RESOLVED_TOPIC: Symbol = symbol_short!("frz_res");
+
+// Beneficiary rotation
+pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
+
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
 
@@ -245,6 +252,7 @@ pub enum ReleaseStatus {
     Locked,
     Released,
     Cancelled,
+    EmergencyFrozen,
 }
 
 #[contracttype]

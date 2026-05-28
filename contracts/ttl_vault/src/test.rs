@@ -4258,3 +4258,135 @@ fn test_get_hibernation_returns_none_when_not_hibernating() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert!(client.get_hibernation(&id).is_none());
 }
+
+// ── Beneficiary Rotation Schedule Tests ──────────────────────────────────────
+
+fn make_beneficiary_entry(env: &Env, addr: Address, bps: u32) -> BeneficiaryEntry {
+    BeneficiaryEntry { address: addr, bps }
+}
+
+#[test]
+fn test_schedule_beneficiary_rotation_stores_entry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let new_ben = Address::generate(&env);
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &9999u64, &entries);
+    let schedule = client.get_beneficiary_rotation_schedule(&id);
+    assert_eq!(schedule.len(), 1);
+    assert_eq!(schedule.get(0).unwrap().effective_timestamp, 9999u64);
+}
+
+#[test]
+fn test_schedule_beneficiary_rotation_non_owner_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let stranger = Address::generate(&env);
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, stranger.clone(), 10_000)];
+    let err = client.try_schedule_beneficiary_rotation(&id, &stranger, &9999u64, &entries)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_schedule_beneficiary_rotation_invalid_bps_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let new_ben = Address::generate(&env);
+    // bps = 5000, not 10_000
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 5_000)];
+    let err = client.try_schedule_beneficiary_rotation(&id, &owner, &9999u64, &entries)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(12)); // InvalidBps
+}
+
+#[test]
+fn test_get_beneficiary_rotation_schedule_empty_by_default() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert_eq!(client.get_beneficiary_rotation_schedule(&id).len(), 0);
+}
+
+#[test]
+fn test_multiple_rotation_entries_stored() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let ben_a = Address::generate(&env);
+    let ben_b = Address::generate(&env);
+    let entries_a = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_a.clone(), 10_000)];
+    let entries_b = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_b.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &1000u64, &entries_a);
+    client.schedule_beneficiary_rotation(&id, &owner, &2000u64, &entries_b);
+    assert_eq!(client.get_beneficiary_rotation_schedule(&id).len(), 2);
+}
+
+#[test]
+fn test_trigger_release_applies_rotation() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    // Use a short interval so expiry is easy to simulate
+    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+
+    let new_ben = Address::generate(&env);
+    // Schedule rotation at timestamp 0 (always in the past)
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &0u64, &entries);
+
+    // Advance ledger past check-in interval to expire the vault
+    env.ledger().with_mut(|l| {
+        l.timestamp = 200;
+    });
+
+    client.trigger_release(&id);
+
+    // new_ben should have received the funds
+    let token = token::Client::new(&env, &token_address);
+    assert_eq!(token.balance(&new_ben), 1_000);
+}
+
+#[test]
+fn test_trigger_release_picks_latest_applicable_rotation() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+
+    let ben_early = Address::generate(&env);
+    let ben_late = Address::generate(&env);
+
+    // Two rotations: timestamp 1 (earlier) and timestamp 50 (later, still past)
+    let entries_early = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_early.clone(), 10_000)];
+    let entries_late = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_late.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &1u64, &entries_early);
+    client.schedule_beneficiary_rotation(&id, &owner, &50u64, &entries_late);
+
+    env.ledger().with_mut(|l| { l.timestamp = 200; });
+    client.trigger_release(&id);
+
+    let token = token::Client::new(&env, &token_address);
+    // The later rotation (timestamp 50) should win
+    assert_eq!(token.balance(&ben_late), 1_000);
+    assert_eq!(token.balance(&ben_early), 0);
+}
+
+#[test]
+fn test_trigger_release_future_rotation_not_applied() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+
+    let new_ben = Address::generate(&env);
+    // Schedule rotation far in the future
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &99999u64, &entries);
+
+    env.ledger().with_mut(|l| { l.timestamp = 200; });
+    client.trigger_release(&id);
+
+    let token = token::Client::new(&env, &token_address);
+    // Original beneficiary should receive funds, not new_ben
+    assert_eq!(token.balance(&beneficiary), 1_000);
+    assert_eq!(token.balance(&new_ben), 0);
+}
