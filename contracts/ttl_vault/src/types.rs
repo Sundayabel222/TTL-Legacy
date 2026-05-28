@@ -84,6 +84,10 @@ pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
 // Issue #499: beneficiary voting
 pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
 pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
+// Issue #512: beneficiary minimum threshold
+pub const MIN_THRESHOLD_SET_TOPIC: Symbol = symbol_short!("min_thr");
+pub const MIN_THRESHOLD_SKIP_TOPIC: Symbol = symbol_short!("thr_skip");
+pub const MIN_THRESHOLD_REDISTRIBUTE_TOPIC: Symbol = symbol_short!("thr_redis");
 
 // Previously missing — used by lib.rs internal helpers
 pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
@@ -241,13 +245,18 @@ pub struct ReleaseEvent {
     pub amount: i128,
 }
 
-/// A single beneficiary entry: (address, basis_points).
+/// A single beneficiary entry: (address, basis_points, minimum_threshold).
 /// All entries in a vault's beneficiaries must sum to 10_000 bps (100%).
+/// If a beneficiary's calculated share is below minimum_threshold (in stroops),
+/// they receive nothing and those funds are redistributed to other beneficiaries.
+/// Set to 0 to disable the minimum threshold for this beneficiary.
 #[contracttype]
 #[derive(Clone)]
 pub struct BeneficiaryEntry {
     pub address: Address,
     pub bps: u32,
+    /// Minimum amount in stroops. If calculated share < minimum_threshold, beneficiary gets 0.
+    pub minimum_threshold: i128,
 }
 
 /// Bridge configuration for cross-chain support.
