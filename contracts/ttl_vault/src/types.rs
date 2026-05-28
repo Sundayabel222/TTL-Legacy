@@ -85,6 +85,25 @@ pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
 pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
 pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
 
+// Previously missing — used by lib.rs internal helpers
+pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
+pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
+pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
+pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("bat_stat");
+
+// Issue: TTL Borrowing
+pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
+pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
+
+// Issue: Check-in Rate Limiting
+pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
+
+// Issue: Accelerated TTL Decay
+pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
+
+// Issue: Geographic Check-in Tracking
+pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -128,6 +147,7 @@ pub enum DataKey {
     VaultPasskeys(u64),
     BackupCodes(u64),
     BeneficiaryDelegate(u64),
+    BeneficiaryDelegationChain(u64),
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
@@ -139,6 +159,7 @@ pub enum DataKey {
     BeneficiaryStatus(u64),
     PasskeyExpiry(u64, BytesN<32>),
     PendingOwnership(u64),
+    PendingBeneficiaryUpdate(u64),
     VaultAuditLog(u64),
     MultiSigConfig(u64),
     MultiSigProposal(u64, u64),
@@ -388,6 +409,15 @@ pub struct OwnershipTransferRequest {
     pub expires_at: u64,
 }
 
+/// Pending beneficiary update request - Issue #490
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingBeneficiaryUpdate {
+    pub new_beneficiary: Address,
+    pub initiated_at: u64,
+    pub unlocks_at: u64,
+}
+
 /// Audit entry for vault operations
 #[contracttype]
 #[derive(Clone)]
@@ -486,21 +516,24 @@ pub struct VaultStatusSummary {
     pub is_expired: bool,
 }
 
-/// Proof of life entry for a beneficiary - Issue #498
-/// Records that a beneficiary has proven liveness before release.
+/// A shared TTL pool that multiple vaults can join.
+/// A single `pool_check_in` resets `last_check_in` for all member vaults.
 #[contracttype]
 #[derive(Clone)]
-pub struct ProofOfLifeEntry {
-    pub beneficiary: Address,
-    pub submitted_at: u64,
-    pub valid_until: u64,
+pub struct TtlPool {
+    pub pool_id: u64,
+    pub owner: Address,
+    pub check_in_interval: u64,
+    pub last_check_in: u64,
+    pub created_at: u64,
 }
 
-/// A single beneficiary vote on release - Issue #499
+/// A biometric credential entry (fingerprint or face template hash).
+/// The raw biometric data never leaves the device — only the SHA-256
+/// hash commitment is stored on-chain.
 #[contracttype]
 #[derive(Clone)]
-pub struct ReleaseVoteEntry {
-    pub voter: Address,
-    pub approve: bool,
-    pub voted_at: u64,
+pub struct BiometricEntry {
+    pub credential_hash: BytesN<32>,
+    pub added_at: u64,
 }
