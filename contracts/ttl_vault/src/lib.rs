@@ -1188,6 +1188,13 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
         }
 
+        // Check beneficiary conditional acceptance threshold - Issue #503
+        if !Self::check_conditional_acceptance_threshold(&env, vault_id, total)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::InsufficientBalance);
+        }
+
         // Check beneficiary proof of life - Issue #498
         let now = env.ledger().timestamp();
         let pol_key = DataKey::ProofOfLife(vault_id);
@@ -5039,6 +5046,75 @@ impl TtlVaultContract {
         Ok(())
     }
 
+    // --- Issue #503: Beneficiary Conditional Acceptance with Threshold ---
+
+    /// Beneficiary accepts role conditionally with minimum balance threshold.
+    /// Only accepts if vault balance >= min_balance_threshold at release time.
+    pub fn accept_with_threshold(
+        env: Env,
+        vault_id: u64,
+        min_balance_threshold: i128,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.beneficiary.require_auth();
+
+        if min_balance_threshold <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let acceptance = BeneficiaryConditionalAcceptance {
+            min_balance_threshold,
+            accepted_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryConditionalAcceptance(vault_id), &acceptance);
+
+        env.events().publish(
+            (BENEFICIARY_CONDITION_ACCEPTED_TOPIC,),
+            (vault_id, vault.beneficiary.clone(), min_balance_threshold),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryConditionalAcceptance(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Gets beneficiary conditional acceptance if it exists.
+    pub fn get_beneficiary_conditional_acceptance(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConditionalAcceptance> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConditionalAcceptance>(
+                &DataKey::BeneficiaryConditionalAcceptance(vault_id),
+            )
+    }
+
+    /// Checks if beneficiary conditional acceptance conditions are met.
+    fn check_conditional_acceptance_threshold(
+        env: &Env,
+        vault_id: u64,
+        current_balance: i128,
+    ) -> Result<bool, ContractError> {
+        if let Some(acceptance) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConditionalAcceptance>(
+                &DataKey::BeneficiaryConditionalAcceptance(vault_id),
+            )
+        {
+            Ok(current_balance >= acceptance.min_balance_threshold)
+        } else {
+            Ok(true)
+        }
+    }
+
     // --- Issue #399: Dispute Resolution ---
 
     /// Files a dispute. Beneficiary-only.
@@ -5108,6 +5184,98 @@ impl TtlVaultContract {
             .persistent()
             .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
             .unwrap_or(DisputeStatus::None)
+    }
+
+    // --- Issue #502: Beneficiary Conflict Resolution ---
+
+    /// File a beneficiary conflict claim. Beneficiary-only.
+    pub fn file_beneficiary_conflict(
+        env: Env,
+        vault_id: u64,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.beneficiary.require_auth();
+
+        if reason.len() == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let mut conflict = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConflict>(&DataKey::BeneficiaryConflict(vault_id))
+            .unwrap_or_else(|| BeneficiaryConflict {
+                vault_id,
+                claims: Vec::new(&env),
+                resolution: ConflictResolution::Pending,
+                resolved_at: None,
+            });
+
+        let claim = BeneficiaryConflictClaim {
+            claimant: vault.beneficiary.clone(),
+            reason,
+            filed_at: env.ledger().timestamp(),
+        };
+
+        conflict.claims.push_back(claim);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryConflict(vault_id), &conflict);
+
+        env.events().publish(
+            (BENEFICIARY_CONFLICT_FILED_TOPIC,),
+            (vault_id, vault.beneficiary.clone()),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryConflict(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Resolve beneficiary conflict. Admin-only.
+    pub fn resolve_beneficiary_conflict(
+        env: Env,
+        vault_id: u64,
+        approved_beneficiary: Address,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+
+        let mut conflict = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConflict>(&DataKey::BeneficiaryConflict(vault_id))
+            .ok_or(ContractError::InvalidBeneficiary)?;
+
+        if conflict.resolution != ConflictResolution::Pending {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        conflict.resolution = ConflictResolution::Approved(approved_beneficiary.clone());
+        conflict.resolved_at = Some(env.ledger().timestamp());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryConflict(vault_id), &conflict);
+
+        env.events().publish(
+            (BENEFICIARY_CONFLICT_RESOLVED_TOPIC,),
+            (vault_id, approved_beneficiary),
+        );
+        Ok(())
+    }
+
+    /// Get beneficiary conflict if it exists.
+    pub fn get_beneficiary_conflict(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConflict> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConflict>(&DataKey::BeneficiaryConflict(vault_id))
     }
 
     // ── Multi-sig ────────────────────────────────────────────────────────────

@@ -47,6 +47,9 @@ pub const SYNC_TTL_TOPIC: Symbol = symbol_short!("sync_ttl");
 pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
 pub const BENEFICIARY_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_acc");
 pub const BENEFICIARY_DECLINED_TOPIC: Symbol = symbol_short!("ben_dec");
+pub const BENEFICIARY_CONDITION_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_cond");
+pub const BENEFICIARY_CONFLICT_FILED_TOPIC: Symbol = symbol_short!("ben_conf");
+pub const BENEFICIARY_CONFLICT_RESOLVED_TOPIC: Symbol = symbol_short!("ben_res");
 pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
 pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
@@ -425,13 +428,50 @@ pub struct WithdrawalScheduleEntry {
     pub amount: i128,
 }
 
-/// Conditional acceptance entry - Issue #400
+/// Conditional acceptance entry - Issue #400, #503
 #[contracttype]
 #[derive(Clone)]
 pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
     pub acceptance_deadline: Option<u64>,
+    pub min_balance_threshold: Option<i128>,
+}
+
+/// Beneficiary conditional acceptance with threshold - Issue #503
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConditionalAcceptance {
+    pub min_balance_threshold: i128,
+    pub accepted_at: u64,
+}
+
+/// Beneficiary conflict claim - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflictClaim {
+    pub claimant: Address,
+    pub reason: String,
+    pub filed_at: u64,
+}
+
+/// Beneficiary conflict resolution - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub enum ConflictResolution {
+    Pending,
+    Approved(Address),
+    Rejected,
+}
+
+/// Beneficiary conflict entry - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflict {
+    pub vault_id: u64,
+    pub claims: Vec<BeneficiaryConflictClaim>,
+    pub resolution: ConflictResolution,
+    pub resolved_at: Option<u64>,
 }
 
 /// Activity log entry for forensic audit trail
