@@ -180,6 +180,10 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // Issue #552: passkey rotation schedule
+    PasskeyRotationSchedule(u64),
+    // Issue #551: global revocation list
+    RevokedPasskeys,
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -536,4 +540,32 @@ pub struct TtlPool {
 pub struct BiometricEntry {
     pub credential_hash: BytesN<32>,
     pub added_at: u64,
+}
+
+// Issue #552: passkey rotation scheduling topics
+pub const PASSKEY_ROTATION_SCHEDULED_TOPIC: Symbol = symbol_short!("pk_rot_s");
+pub const PASSKEY_ROTATION_DUE_TOPIC: Symbol = symbol_short!("pk_rot_d");
+
+// Issue #551: passkey revocation topics
+pub const PASSKEY_REVOKED_TOPIC: Symbol = symbol_short!("pk_rev");
+
+/// Passkey rotation schedule - Issue #552
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyRotationSchedule {
+    /// How often the passkey should be rotated, in seconds.
+    pub interval_secs: u64,
+    /// Timestamp of the last rotation (or schedule creation if never rotated).
+    pub last_rotated_at: u64,
+    /// Timestamp when the next rotation is due.
+    pub next_rotation_at: u64,
+}
+
+/// A single entry in the global passkey revocation list - Issue #551
+#[contracttype]
+#[derive(Clone)]
+pub struct RevokedPasskeyEntry {
+    pub passkey_hash: BytesN<32>,
+    pub revoked_at: u64,
+    pub revoked_by: Address,
 }

@@ -38,6 +38,8 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
+    PasskeyRotationSchedule, RevokedPasskeyEntry,
+    PASSKEY_ROTATION_SCHEDULED_TOPIC, PASSKEY_ROTATION_DUE_TOPIC, PASSKEY_REVOKED_TOPIC,
 };
 
 #[cfg(test)]
@@ -148,6 +150,8 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
+    PasskeyRevoked = 55,
+    InvalidRotationInterval = 56,
 }
 
 #[contract]
@@ -740,7 +744,12 @@ impl TtlVaultContract {
                 return Err(ContractError::InvalidPasskey);
             }
         }
-        
+
+        // Issue #551: reject revoked passkeys
+        if Self::is_passkey_revoked(env.clone(), passkey_hash.clone()) {
+            return Err(ContractError::PasskeyRevoked);
+        }
+
         vault.last_check_in = now;
         
         // Cap TTL at max_ttl_seconds
@@ -5837,5 +5846,150 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    // --- Issue #552: Passkey Rotation Scheduling ---
+
+    /// Sets a passkey rotation schedule for a vault.
+    ///
+    /// The owner specifies how often (in seconds) the passkey should be rotated.
+    /// The schedule records when rotation is next due and emits an event.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to configure
+    /// * `caller` - The vault owner (must authorize)
+    /// * `interval_secs` - Rotation interval in seconds (must be > 0)
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InvalidRotationInterval` - If interval is zero
+    pub fn set_passkey_rotation_schedule(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        interval_secs: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if interval_secs == 0 {
+            return Err(ContractError::InvalidRotationInterval);
+        }
+        let now = env.ledger().timestamp();
+        let schedule = PasskeyRotationSchedule {
+            interval_secs,
+            last_rotated_at: now,
+            next_rotation_at: now + interval_secs,
+        };
+        let key = DataKey::PasskeyRotationSchedule(vault_id);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (PASSKEY_ROTATION_SCHEDULED_TOPIC, vault_id),
+            (interval_secs, now + interval_secs),
+        );
+        Ok(())
+    }
+
+    /// Returns the passkey rotation schedule for a vault, if set.
+    pub fn get_passkey_rotation_schedule(env: Env, vault_id: u64) -> Option<PasskeyRotationSchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PasskeyRotationSchedule(vault_id))
+    }
+
+    /// Returns true if the passkey rotation is currently due for a vault.
+    ///
+    /// Emits `PASSKEY_ROTATION_DUE_TOPIC` when the schedule has passed.
+    pub fn is_passkey_rotation_due(env: Env, vault_id: u64) -> bool {
+        let schedule: PasskeyRotationSchedule = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::PasskeyRotationSchedule(vault_id))
+        {
+            Some(s) => s,
+            None => return false,
+        };
+        let now = env.ledger().timestamp();
+        let due = now >= schedule.next_rotation_at;
+        if due {
+            env.events().publish(
+                (PASSKEY_ROTATION_DUE_TOPIC, vault_id),
+                schedule.next_rotation_at,
+            );
+        }
+        due
+    }
+
+    // --- Issue #551: Passkey Revocation List ---
+
+    /// Revokes a passkey globally, adding it to the revocation list.
+    ///
+    /// Only the admin can revoke passkeys globally. Once revoked, the passkey
+    /// will be rejected by `check_in` across all vaults.
+    ///
+    /// # Arguments
+    /// * `caller` - The contract admin (must authorize)
+    /// * `passkey_hash` - The passkey hash to revoke
+    ///
+    /// # Errors
+    /// * `ContractError::NotAdmin` - If caller is not the admin
+    pub fn revoke_passkey(
+        env: Env,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)?;
+        if caller != admin {
+            return Err(ContractError::NotAdmin);
+        }
+        let now = env.ledger().timestamp();
+        let key = DataKey::RevokedPasskeys;
+        let mut list: Vec<RevokedPasskeyEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        list.push_back(RevokedPasskeyEntry {
+            passkey_hash: passkey_hash.clone(),
+            revoked_at: now,
+            revoked_by: caller,
+        });
+        env.storage().persistent().set(&key, &list);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((PASSKEY_REVOKED_TOPIC, symbol_short!("global")), passkey_hash);
+        Ok(())
+    }
+
+    /// Returns true if the given passkey hash is on the global revocation list.
+    pub fn is_passkey_revoked(env: Env, passkey_hash: BytesN<32>) -> bool {
+        let list: Vec<RevokedPasskeyEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RevokedPasskeys)
+            .unwrap_or_else(|| Vec::new(&env));
+        for entry in list.iter() {
+            if entry.passkey_hash == passkey_hash {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns all entries in the global passkey revocation list.
+    pub fn get_revoked_passkeys(env: Env) -> Vec<RevokedPasskeyEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RevokedPasskeys)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
