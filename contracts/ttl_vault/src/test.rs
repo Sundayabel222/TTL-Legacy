@@ -2062,9 +2062,9 @@ fn test_trigger_release_multi_beneficiary_bps_split_distributes_correctly() {
 
     let entries = soroban_sdk::vec![
         &env,
-        BeneficiaryEntry { address: ben_a.clone(), bps: 5_000 },
-        BeneficiaryEntry { address: ben_b.clone(), bps: 3_000 },
-        BeneficiaryEntry { address: ben_c.clone(), bps: 2_000 },
+        BeneficiaryEntry { address: ben_a.clone(), bps: 5_000, minimum_threshold: 0 },
+        BeneficiaryEntry { address: ben_b.clone(), bps: 3_000, minimum_threshold: 0 },
+        BeneficiaryEntry { address: ben_c.clone(), bps: 2_000, minimum_threshold: 0 },
     ];
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
@@ -2091,6 +2091,211 @@ fn test_trigger_release_multi_beneficiary_bps_split_distributes_correctly() {
     assert_eq!(total_distributed, total);
 }
 
+// ---- Issue #512: Beneficiary Minimum Threshold Tests ----
+
+#[test]
+fn test_minimum_threshold_skips_beneficiary_below_threshold() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // Create 2 beneficiaries: A gets 50%, B gets 50%
+    let ben_a = beneficiary.clone();
+    let ben_b = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &ben_a, &100u64, &None);
+
+    // Set minimum threshold: A = 3000, B = 6000
+    // With 10_000 total: A gets 5000 (meets threshold), B gets 5000 (below 6000 threshold)
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: ben_a.clone(), bps: 5_000, minimum_threshold: 3_000 },
+        BeneficiaryEntry { address: ben_b.clone(), bps: 5_000, minimum_threshold: 6_000 },
+    ];
+    client.set_beneficiaries(&vault_id, &owner, &entries);
+
+    client.deposit(&vault_id, &owner, &10_000i128);
+
+    // Expire and trigger release
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    // B should not receive anything since 5000 < 6000 threshold
+    // A should receive all 10_000 (since they are the only qualifying beneficiary)
+    assert_eq!(token_client.balance(&ben_a), 10_000i128);
+    assert_eq!(token_client.balance(&ben_b), 0i128);
+}
+
+#[test]
+fn test_minimum_threshold_redistributes_to_qualifying_beneficiaries() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    let ben_a = beneficiary.clone();
+    let ben_b = Address::generate(&env);
+    let ben_c = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &ben_a, &100u64, &None);
+
+    // A: 33.33% (3333), B: 33.33% (3333), C: 33.34% (3334)
+    // Thresholds: A=1000 (meets), B=4000 (fails), C=1000 (meets)
+    // B's share (3333) redistributed to A and C proportionally
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: ben_a.clone(), bps: 3_333, minimum_threshold: 1_000 },
+        BeneficiaryEntry { address: ben_b.clone(), bps: 3_333, minimum_threshold: 4_000 },
+        BeneficiaryEntry { address: ben_c.clone(), bps: 3_334, minimum_threshold: 1_000 },
+    ];
+    client.set_beneficiaries(&vault_id, &owner, &entries);
+
+    client.deposit(&vault_id, &owner, &10_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    // A and C are qualifying (3333 + 3334 = 6667 bps of 10000)
+    // Redistribution: A gets 10000 * 3333/6667 ≈ 5000, C gets 10000 * 3334/6667 ≈ 5000
+    let ben_a_balance = token_client.balance(&ben_a);
+    let ben_b_balance = token_client.balance(&ben_b);
+    let ben_c_balance = token_client.balance(&ben_c);
+
+    assert_eq!(ben_b_balance, 0i128, "B should not receive anything");
+    assert!(ben_a_balance > 0, "A should receive redistributed funds");
+    assert!(ben_c_balance > 0, "C should receive redistributed funds");
+    assert_eq!(ben_a_balance + ben_c_balance, 10_000i128, "Total should be distributed");
+}
+
+#[test]
+fn test_minimum_threshold_all_below_threshold_returns_to_owner() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    let ben_a = beneficiary.clone();
+    let ben_b = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &ben_a, &100u64, &None);
+
+    // Both beneficiaries have high thresholds that won't be met with 1000 total
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: ben_a.clone(), bps: 5_000, minimum_threshold: 2_000 },
+        BeneficiaryEntry { address: ben_b.clone(), bps: 5_000, minimum_threshold: 2_000 },
+    ];
+    client.set_beneficiaries(&vault_id, &owner, &entries);
+
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    // No qualifying beneficiaries: funds return to owner
+    assert_eq!(token_client.balance(&ben_a), 0i128, "A below threshold");
+    assert_eq!(token_client.balance(&ben_b), 0i128, "B below threshold");
+    assert_eq!(token_client.balance(&owner), 1_000_000i128 - 1_000i128 + 1_000i128, "Owner gets funds back");
+}
+
+#[test]
+fn test_set_beneficiary_minimum_threshold() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let ben_b = Address::generate(&env);
+
+    // Add beneficiary
+    client.add_beneficiary(&vault_id, &owner, &ben_b, &5_000u32);
+
+    // Set minimum threshold
+    client.set_beneficiary_minimum_threshold(&vault_id, &owner, &beneficiary, &1_000i128);
+
+    // Verify threshold was set
+    let threshold = client.get_beneficiary_minimum_threshold(&vault_id, &beneficiary);
+    assert_eq!(threshold, Some(1_000i128));
+}
+
+#[test]
+fn test_get_beneficiary_minimum_threshold_not_found() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let nonexistent = Address::generate(&env);
+
+    let threshold = client.get_beneficiary_minimum_threshold(&vault_id, &nonexistent);
+    assert_eq!(threshold, None, "Non-existent beneficiary should return None");
+}
+
+#[test]
+fn test_get_beneficiaries_with_thresholds() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let ben_a = beneficiary.clone();
+    let ben_b = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &ben_a, &100u64, &None);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: ben_a.clone(), bps: 6_000, minimum_threshold: 1_000 },
+        BeneficiaryEntry { address: ben_b.clone(), bps: 4_000, minimum_threshold: 500 },
+    ];
+    client.set_beneficiaries(&vault_id, &owner, &entries);
+
+    let beneficiaries = client.get_beneficiaries_with_thresholds(&vault_id);
+    assert!(beneficiaries.is_some(), "Should return Some(beneficiaries)");
+
+    let bens = beneficiaries.unwrap();
+    assert_eq!(bens.len(), 2);
+    assert_eq!(bens.get(0).unwrap().minimum_threshold, 1_000i128);
+    assert_eq!(bens.get(1).unwrap().minimum_threshold, 500i128);
+}
+
+#[test]
+fn test_minimum_threshold_zero_disables_threshold() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    let ben_a = beneficiary.clone();
+    let ben_b = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &ben_a, &100u64, &None);
+
+    // A: 50%, B: 50%, but A has threshold of 0 (disabled) and B has threshold of 8000
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: ben_a.clone(), bps: 5_000, minimum_threshold: 0 },
+        BeneficiaryEntry { address: ben_b.clone(), bps: 5_000, minimum_threshold: 8_000 },
+    ];
+    client.set_beneficiaries(&vault_id, &owner, &entries);
+
+    client.deposit(&vault_id, &owner, &10_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    // B doesn't meet threshold (5000 < 8000), A's threshold is 0 so it qualifies
+    assert_eq!(token_client.balance(&ben_a), 10_000i128);
+    assert_eq!(token_client.balance(&ben_b), 0i128);
+}
+
+#[test]
+fn test_minimum_threshold_update_existing() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let ben_b = Address::generate(&env);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: beneficiary.clone(), bps: 5_000, minimum_threshold: 1_000 },
+        BeneficiaryEntry { address: ben_b.clone(), bps: 5_000, minimum_threshold: 1_000 },
+    ];
+    client.set_beneficiaries(&vault_id, &owner, &entries);
+
+    // Update ben_b's threshold
+    client.set_beneficiary_minimum_threshold(&vault_id, &owner, &ben_b, &5_000i128);
+
+    let new_threshold = client.get_beneficiary_minimum_threshold(&vault_id, &ben_b);
+    assert_eq!(new_threshold, Some(5_000i128));
+}
+
 // ---- Vesting schedule tests ----
 
 /// Helper: create vault, deposit, expire, trigger_release (with vesting schedule attached).
@@ -2106,7 +2311,7 @@ fn setup_vesting(
     let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
     client.deposit(&vault_id, owner, &amount);
     let start_time = env.ledger().timestamp() + 200; // first installment after expiry
-    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments);
+    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &0u64);
     // Expire the vault
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
@@ -2120,7 +2325,7 @@ fn test_set_vesting_schedule_stores_schedule() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let start = env.ledger().timestamp() + 50;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
 
     let sched = client.get_vesting_schedule(&vault_id).unwrap();
     assert_eq!(sched.start_time, start);
@@ -2128,6 +2333,7 @@ fn test_set_vesting_schedule_stores_schedule() {
     assert_eq!(sched.num_installments, 4u32);
     assert_eq!(sched.claimed_installments, 0u32);
     assert_eq!(sched.total_amount, 1_000i128);
+    assert_eq!(sched.cliff_period, 0u64);
 }
 
 #[test]
@@ -2139,7 +2345,7 @@ fn test_set_vesting_schedule_requires_owner() {
     let stranger = Address::generate(&env);
     let start = env.ledger().timestamp() + 50;
     let err = client
-        .try_set_vesting_schedule(&vault_id, &stranger, &start, &100u64, &4u32)
+        .try_set_vesting_schedule(&vault_id, &stranger, &start, &100u64, &4u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::NotOwner);
@@ -2152,7 +2358,7 @@ fn test_set_vesting_schedule_rejects_zero_interval() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &0u64, &4u32)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &0u64, &4u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::InvalidInterval);
@@ -2165,7 +2371,7 @@ fn test_set_vesting_schedule_rejects_zero_installments() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &0u32)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &0u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::InvalidInterval);
@@ -2178,7 +2384,7 @@ fn test_set_vesting_schedule_rejects_empty_vault() {
     // No deposit — balance is 0
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &4u32)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &4u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::EmptyVault);
@@ -2258,7 +2464,7 @@ fn test_claim_nothing_to_claim_before_start_time() {
 
     // start_time is far in the future
     let start = env.ledger().timestamp() + 10_000;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
 
     // Expire and release
     env.ledger().with_mut(|l| l.timestamp += 200);
@@ -2327,7 +2533,7 @@ fn test_vesting_with_multi_beneficiary_split() {
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
     let start = env.ledger().timestamp() + 200;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &2u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &2u32, &0u64);
 
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
@@ -2346,7 +2552,7 @@ fn test_set_vesting_emits_event() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let start = env.ledger().timestamp() + 50;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
 
     assert!(find_event_by_topic(&env, types::SET_VESTING_TOPIC));
 }
@@ -2360,6 +2566,136 @@ fn test_claim_vested_emits_event() {
     client.claim_vested_installment(&vault_id);
 
     assert!(find_event_by_topic(&env, types::CLAIM_VEST_TOPIC));
+}
+
+// ---- Cliff period tests (#534) ----
+
+/// Helper: set up a vesting schedule with a cliff period.
+/// cliff_period is in seconds from start_time.
+fn setup_vesting_with_cliff(
+    env: &Env,
+    owner: &Address,
+    beneficiary: &Address,
+    client: &TtlVaultContractClient<'static>,
+    amount: i128,
+    num_installments: u32,
+    interval: u64,
+    cliff_period: u64,
+) -> u64 {
+    let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
+    client.deposit(&vault_id, owner, &amount);
+    let start_time = env.ledger().timestamp() + 200;
+    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &cliff_period);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+    vault_id
+}
+
+#[test]
+fn test_cliff_period_stored_in_schedule() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    let start = env.ledger().timestamp() + 50;
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &500u64);
+
+    let sched = client.get_vesting_schedule(&vault_id).unwrap();
+    assert_eq!(sched.cliff_period, 500u64);
+}
+
+#[test]
+fn test_claim_blocked_before_cliff() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // cliff = 300s, interval = 100s; after trigger_release we are at start_time
+    // so cliff has NOT been reached yet
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 300u64);
+
+    // Advance 100s — past first installment window but still inside cliff
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    let err = client
+        .try_claim_vested_installment(&vault_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::CliffNotReached);
+}
+
+#[test]
+fn test_claim_allowed_after_cliff() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // cliff = 200s, interval = 100s; 4 installments of 250 each
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 200u64);
+
+    // Advance 200s — cliff is now reached; 3 installment windows have elapsed
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    let claimed = client.claim_vested_installment(&vault_id);
+    assert_eq!(claimed, 750i128); // 3 installments × 250
+    assert_eq!(token_client.balance(&beneficiary), 750i128);
+}
+
+#[test]
+fn test_cliff_reached_event_emitted_on_first_claim() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // cliff = 100s
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 100u64);
+
+    // Advance past cliff
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.claim_vested_installment(&vault_id);
+
+    assert!(find_event_by_topic(&env, types::CLIFF_REACHED_TOPIC));
+}
+
+#[test]
+fn test_cliff_reached_event_not_emitted_on_second_claim() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // cliff = 100s, interval = 100s
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 100u64);
+
+    // First claim (past cliff)
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.claim_vested_installment(&vault_id);
+
+    // Clear events by checking count before second claim
+    let events_after_first = env.events().all().len();
+
+    // Second claim — no cliff event expected
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.claim_vested_installment(&vault_id);
+
+    // Verify no additional CLIFF_REACHED event was emitted
+    let new_events: soroban_sdk::Vec<_> = env.events().all();
+    let cliff_topic = types::CLIFF_REACHED_TOPIC;
+    let mut cliff_count = 0u32;
+    for i in events_after_first..new_events.len() {
+        let (topics, _): (soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val) = new_events.get(i).unwrap();
+        if topics.len() > 0 {
+            if let Ok(t) = soroban_sdk::Symbol::try_from(topics.get(0).unwrap()) {
+                if t == cliff_topic {
+                    cliff_count += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cliff_count, 0, "CLIFF_REACHED should not be emitted on second claim");
+}
+
+#[test]
+fn test_zero_cliff_period_behaves_as_no_cliff() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // cliff_period = 0 → no cliff, first installment claimable at start_time
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 0u64);
+
+    let claimed = client.claim_vested_installment(&vault_id);
+    assert_eq!(claimed, 250i128);
+    assert_eq!(token_client.balance(&beneficiary), 250i128);
 }
 
 #[test]

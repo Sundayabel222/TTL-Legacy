@@ -30,7 +30,7 @@ use types::{
     RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_MERGED_TOPIC,
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
     MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
-    OWNERSHIP_CANCELLED_TOPIC,
+    OWNERSHIP_CANCELLED_TOPIC, MIN_THRESHOLD_SET_TOPIC, MIN_THRESHOLD_SKIP_TOPIC, MIN_THRESHOLD_REDISTRIBUTE_TOPIC,
     MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
     VAULT_CAP_TOPIC,
     CheckInHistoryEntry, CheckInStreak,
@@ -1286,21 +1286,57 @@ impl TtlVaultContract {
                     ReleaseEvent { vault_id, beneficiary: vault.beneficiary.clone(), amount: release_amount },
                 );
             } else {
-                let mut distributed: i128 = 0;
-                let last_idx = vault.beneficiaries.len() - 1;
+                // Issue #512: Apply minimum threshold logic to beneficiary distributions
+                // Two-pass algorithm: first identify qualifying beneficiaries, then distribute
+                
+                // Pass 1: Identify which beneficiaries meet the threshold
+                let mut qualifying_indices: Vec<u32> = Vec::new(&env);
+                let mut total_qualifying_bps: u32 = 0;
+                
                 for (i, entry) in vault.beneficiaries.iter().enumerate() {
-                    let share = if i as u32 == last_idx {
-                        release_amount - distributed
+                    let initial_share = release_amount * (entry.bps as i128) / 10_000;
+                    if initial_share >= entry.minimum_threshold {
+                        qualifying_indices.push_back(i as u32);
+                        total_qualifying_bps = total_qualifying_bps.saturating_add(entry.bps);
                     } else {
-                        release_amount * (entry.bps as i128) / 10_000
-                    };
-                    if share > 0 {
-                        token_client.transfer(&env.current_contract_address(), &entry.address, &share);
+                        // Emit event for skipped beneficiary
+                        env.events().publish(
+                            (MIN_THRESHOLD_SKIP_TOPIC,),
+                            (vault_id, entry.address.clone(), initial_share, entry.minimum_threshold),
+                        );
                     }
-                    distributed += share;
+                }
+
+                // Pass 2: Distribute to qualifying beneficiaries
+                let mut distributed: i128 = 0;
+                if qualifying_indices.len() > 0 {
+                    for idx_iter in 0..qualifying_indices.len() {
+                        let i = qualifying_indices.get(idx_iter);
+                        let entry = vault.beneficiaries.get(i as usize);
+                        
+                        let share = if idx_iter as u32 == (qualifying_indices.len() - 1) as u32 {
+                            // Last qualifying beneficiary gets remainder
+                            release_amount - distributed
+                        } else {
+                            // Recalculate share proportionally among qualifying beneficiaries
+                            release_amount * (entry.bps as i128) / (total_qualifying_bps as i128)
+                        };
+                        
+                        if share > 0 {
+                            token_client.transfer(&env.current_contract_address(), &entry.address, &share);
+                            env.events().publish(
+                                (MIN_THRESHOLD_REDISTRIBUTE_TOPIC,),
+                                (vault_id, entry.address.clone(), share),
+                            );
+                        }
+                        distributed += share;
+                    }
+                } else {
+                    // No qualifying beneficiaries: return all funds to owner
+                    token_client.transfer(&env.current_contract_address(), &vault.owner, &release_amount);
                     env.events().publish(
                         (RELEASE_TOPIC,),
-                        ReleaseEvent { vault_id, beneficiary: entry.address.clone(), amount: share },
+                        ReleaseEvent { vault_id, beneficiary: vault.owner.clone(), amount: release_amount },
                     );
                 }
             }
@@ -1719,6 +1755,7 @@ impl TtlVaultContract {
         vault.beneficiaries.push_back(BeneficiaryEntry {
             address: address.clone(),
             bps: percentage,
+            minimum_threshold: 0,
         });
         
         Self::save_vault(&env, vault_id, &vault);
@@ -1779,6 +1816,122 @@ impl TtlVaultContract {
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((BENEFICIARY_UPDATED_TOPIC, vault_id), address);
         Ok(())
+    }
+
+    // --- Issue #512: Beneficiary Minimum Threshold ---
+
+    /// Updates the minimum threshold for a specific beneficiary.
+    ///
+    /// The minimum threshold is the minimum amount (in stroops) that a beneficiary must
+    /// receive. If their calculated share is below this threshold, they receive nothing
+    /// and the funds are redistributed to other qualifying beneficiaries.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    /// * `caller` - The address of the caller (must be the vault owner)
+    /// * `beneficiary_address` - The address of the beneficiary to update
+    /// * `minimum_threshold` - The minimum amount in stroops (0 to disable)
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `Err` on failure
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
+    /// * `ContractError::InvalidBeneficiary` - If beneficiary is not found
+    pub fn set_beneficiary_minimum_threshold(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        beneficiary_address: Address,
+        minimum_threshold: i128,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if minimum_threshold < 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // Find and update the beneficiary
+        let mut found = false;
+        let mut updated_beneficiaries = Vec::new(&env);
+        for entry in vault.beneficiaries.iter() {
+            if entry.address == beneficiary_address {
+                let mut updated_entry = entry.clone();
+                updated_entry.minimum_threshold = minimum_threshold;
+                updated_beneficiaries.push_back(updated_entry);
+                found = true;
+            } else {
+                updated_beneficiaries.push_back(entry);
+            }
+        }
+
+        if !found {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        vault.beneficiaries = updated_beneficiaries;
+        Self::save_vault(&env, vault_id, &vault);
+        Self::append_activity_log(
+            &env,
+            vault_id,
+            "set_beneficiary_minimum_threshold",
+            &caller,
+            "",
+        );
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (MIN_THRESHOLD_SET_TOPIC, vault_id),
+            (beneficiary_address, minimum_threshold),
+        );
+        Ok(())
+    }
+
+    /// Gets the minimum threshold for a specific beneficiary.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    /// * `beneficiary_address` - The address of the beneficiary to query
+    ///
+    /// # Returns
+    /// `Some(minimum_threshold)` if the beneficiary exists, `None` otherwise
+    pub fn get_beneficiary_minimum_threshold(
+        env: Env,
+        vault_id: u64,
+        beneficiary_address: Address,
+    ) -> Option<i128> {
+        if let Some(vault) = Self::try_load_vault(&env, vault_id) {
+            for entry in vault.beneficiaries.iter() {
+                if entry.address == beneficiary_address {
+                    return Some(entry.minimum_threshold);
+                }
+            }
+        }
+        None
+    }
+
+    /// Gets all beneficiaries and their minimum thresholds for a vault.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The unique identifier of the vault
+    ///
+    /// # Returns
+    /// Vector of BeneficiaryEntry structs with addresses, BPS, and minimum thresholds
+    pub fn get_beneficiaries_with_thresholds(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<Vec<BeneficiaryEntry>> {
+        Self::try_load_vault(&env, vault_id).map(|vault| vault.beneficiaries.clone())
     }
 
     // --- Task 4: update_metadata ---
@@ -1896,6 +2049,7 @@ impl TtlVaultContract {
     /// * `start_time` - Unix timestamp of the first claimable installment
     /// * `interval` - Seconds between installments (must be > 0)
     /// * `num_installments` - Number of tranches (must be > 0)
+    /// * `cliff_period` - Seconds after `start_time` before any installment can be claimed (0 = no cliff)
     ///
     /// # Errors
     /// * `ContractError::Paused` - If the contract is paused
@@ -1910,6 +2064,7 @@ impl TtlVaultContract {
         start_time: u64,
         interval: u64,
         num_installments: u32,
+        cliff_period: u64,
     ) -> Result<(), ContractError> {
         Self::assert_not_paused(&env);
         caller.require_auth();
@@ -1932,6 +2087,7 @@ impl TtlVaultContract {
             num_installments,
             claimed_installments: 0,
             total_amount: vault.balance,
+            cliff_period,
         };
         let key = DataKey::VestingSchedule(vault_id);
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
@@ -1940,7 +2096,7 @@ impl TtlVaultContract {
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish(
             (SET_VESTING_TOPIC, vault_id),
-            (start_time, interval, num_installments, vault.balance),
+            (start_time, interval, num_installments, vault.balance, cliff_period),
         );
         Ok(())
     }
@@ -1994,6 +2150,17 @@ impl TtlVaultContract {
         let now = env.ledger().timestamp();
         if now < schedule.start_time {
             return Err(ContractError::NothingToClaimYet);
+        }
+
+        // Enforce cliff: no claims until start_time + cliff_period has elapsed
+        if schedule.cliff_period > 0 && now < schedule.start_time + schedule.cliff_period {
+            return Err(ContractError::CliffNotReached);
+        }
+
+        // Emit cliff reached event on the first claim after cliff (cliff_period > 0 and no prior claims)
+        let cliff_just_reached = schedule.cliff_period > 0 && schedule.claimed_installments == 0;
+        if cliff_just_reached {
+            env.events().publish((CLIFF_REACHED_TOPIC, vault_id), (now,));
         }
 
         // How many installments are unlocked so far?
