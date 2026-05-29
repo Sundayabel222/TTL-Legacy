@@ -2311,7 +2311,7 @@ fn setup_vesting(
     let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
     client.deposit(&vault_id, owner, &amount);
     let start_time = env.ledger().timestamp() + 200; // first installment after expiry
-    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &0u64);
+    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &amount, &0u64);
     // Expire the vault
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
@@ -2325,9 +2325,9 @@ fn test_set_vesting_schedule_stores_schedule() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let start = env.ledger().timestamp() + 50;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &1_000i128, &0u64);
 
-    let sched = client.get_vesting_schedule(&vault_id).unwrap();
+    let sched = client.get_vesting_schedule(&vault_id, &0u32).unwrap();
     assert_eq!(sched.start_time, start);
     assert_eq!(sched.interval, 100u64);
     assert_eq!(sched.num_installments, 4u32);
@@ -2345,7 +2345,7 @@ fn test_set_vesting_schedule_requires_owner() {
     let stranger = Address::generate(&env);
     let start = env.ledger().timestamp() + 50;
     let err = client
-        .try_set_vesting_schedule(&vault_id, &stranger, &start, &100u64, &4u32, &0u64)
+        .try_set_vesting_schedule(&vault_id, &stranger, &start, &100u64, &4u32, &1_000i128, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::NotOwner);
@@ -2358,7 +2358,7 @@ fn test_set_vesting_schedule_rejects_zero_interval() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &0u64, &4u32, &0u64)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &0u64, &4u32, &1_000i128, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::InvalidInterval);
@@ -2371,7 +2371,7 @@ fn test_set_vesting_schedule_rejects_zero_installments() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &0u32, &0u64)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &0u32, &1_000i128, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::InvalidInterval);
@@ -2384,7 +2384,7 @@ fn test_set_vesting_schedule_rejects_empty_vault() {
     // No deposit — balance is 0
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &4u32, &0u64)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &4u32, &1_000i128, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::EmptyVault);
@@ -2414,7 +2414,7 @@ fn test_claim_first_installment() {
     assert_eq!(token_client.balance(&beneficiary), 250i128);
     assert_eq!(client.get_vault(&vault_id).balance, 750i128);
 
-    let sched = client.get_vesting_schedule(&vault_id).unwrap();
+    let sched = client.get_vesting_schedule(&vault_id, &0u32).unwrap();
     assert_eq!(sched.claimed_installments, 1u32);
 }
 
@@ -2434,7 +2434,7 @@ fn test_claim_multiple_installments_at_once() {
     assert_eq!(claimed, 750i128);
     assert_eq!(token_client.balance(&beneficiary), 750i128);
 
-    let sched = client.get_vesting_schedule(&vault_id).unwrap();
+    let sched = client.get_vesting_schedule(&vault_id, &0u32).unwrap();
     assert_eq!(sched.claimed_installments, 3u32);
 }
 
@@ -2452,7 +2452,7 @@ fn test_claim_all_installments_drains_vault() {
     assert_eq!(token_client.balance(&beneficiary), 1_000i128);
     assert_eq!(client.get_vault(&vault_id).balance, 0i128);
 
-    let sched = client.get_vesting_schedule(&vault_id).unwrap();
+    let sched = client.get_vesting_schedule(&vault_id, &0u32).unwrap();
     assert_eq!(sched.claimed_installments, 4u32);
 }
 
@@ -2464,7 +2464,7 @@ fn test_claim_nothing_to_claim_before_start_time() {
 
     // start_time is far in the future
     let start = env.ledger().timestamp() + 10_000;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &1_000i128, &0u64);
 
     // Expire and release
     env.ledger().with_mut(|l| l.timestamp += 200);
@@ -2533,7 +2533,7 @@ fn test_vesting_with_multi_beneficiary_split() {
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
     let start = env.ledger().timestamp() + 200;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &2u32, &0u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &2u32, &1_000i128, &0u64);
 
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
@@ -2552,7 +2552,7 @@ fn test_set_vesting_emits_event() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let start = env.ledger().timestamp() + 50;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &1_000i128, &0u64);
 
     assert!(find_event_by_topic(&env, types::SET_VESTING_TOPIC));
 }
@@ -2585,7 +2585,7 @@ fn setup_vesting_with_cliff(
     let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
     client.deposit(&vault_id, owner, &amount);
     let start_time = env.ledger().timestamp() + 200;
-    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &cliff_period);
+    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &amount, &cliff_period);
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
     vault_id
@@ -2598,9 +2598,9 @@ fn test_cliff_period_stored_in_schedule() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let start = env.ledger().timestamp() + 50;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &500u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &1_000i128, &500u64);
 
-    let sched = client.get_vesting_schedule(&vault_id).unwrap();
+    let sched = client.get_vesting_schedule(&vault_id, &0u32).unwrap();
     assert_eq!(sched.cliff_period, 500u64);
 }
 
@@ -2983,7 +2983,7 @@ fn test_security_vesting_prevents_double_claim() {
     
     // Set vesting schedule
     let start_time = env.ledger().timestamp() + 200;
-    let result = client.try_set_vesting_schedule(&vault_id, &owner, &start_time, &100u64, &2);
+    let result = client.try_set_vesting_schedule(&vault_id, &owner, &start_time, &100u64, &2u32, &100_000i128, &0u64);
     assert!(result.is_ok());
     
     // Expire and release
@@ -5465,7 +5465,7 @@ fn test_clawback_unvested_requires_released_status() {
     let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
     client.deposit(&vault_id, &owner, &1_000i128);
     let start = env.ledger().timestamp() + 200;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &1_000i128, &0u64);
     // Vault is still Locked, not Released
 
     let err = client
@@ -5552,24 +5552,24 @@ fn test_clawback_unvested_multiple_schedules() {
 
     // Set first vesting schedule: 600 total, 3 installments of 200 each
     let start1 = env.ledger().timestamp() + 200;
-    client.set_vesting_schedule(&vault_id, &owner, &start1, &100u64, &3u32, &0u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start1, &100u64, &3u32, &600i128, &0u64);
 
     // Set second vesting schedule: 400 total, 2 installments of 200 each
-    client.set_vesting_schedule(&vault_id, &owner, &start1, &100u64, &2u32, &0u64);
+    client.set_vesting_schedule(&vault_id, &owner, &start1, &100u64, &2u32, &400i128, &0u64);
 
     // Expire and release
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
 
-    // Claim first installment from the first schedule (200)
+    // Claim first installment from all schedules (200 from each = 400)
     env.ledger().with_mut(|l| l.timestamp += 100);
     client.claim_vested_installment(&vault_id);
 
-    // Clawback: remaining unvested = (2 * 200) + (2 * 200) = 800
+    // Clawback: remaining unvested = (2 * 200) + (1 * 200) = 600
     let clawed_back = client.clawback_unvested(&vault_id, &owner);
-    assert_eq!(clawed_back, 800i128);
+    assert_eq!(clawed_back, 600i128);
     let vault = client.get_vault(&vault_id);
-    assert_eq!(vault.balance, 1_000i128); // 2000 - 200 (claimed) - 800 (clawback) = 1000
+    assert_eq!(vault.balance, 1_000i128); // 2000 - 400 (claimed) - 600 (clawback) = 1000
 }
 
 #[test]

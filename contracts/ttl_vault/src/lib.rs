@@ -1299,7 +1299,7 @@ impl TtlVaultContract {
         let has_vesting = env
             .storage()
             .persistent()
-            .has(&DataKey::VestingSchedule(vault_id));
+            .has(&DataKey::VestingScheduleCount(vault_id));
         let has_milestone_vesting = env
             .storage()
             .persistent()
@@ -2144,9 +2144,30 @@ impl TtlVaultContract {
         Ok(schedule_index)
     }
 
-    /// Returns the vesting schedule for a vault, if one exists.
-    pub fn get_vesting_schedule(env: Env, vault_id: u64) -> Option<VestingSchedule> {
-        env.storage().persistent().get(&DataKey::VestingSchedule(vault_id))
+    /// Returns a specific vesting schedule for a vault, if one exists at the given index.
+    pub fn get_vesting_schedule(env: Env, vault_id: u64, schedule_index: u32) -> Option<VestingSchedule> {
+        env.storage().persistent().get(&DataKey::VestingSchedule(vault_id, schedule_index))
+    }
+
+    /// Returns all vesting schedules for a vault.
+    pub fn get_vesting_schedules(env: Env, vault_id: u64) -> Vec<VestingSchedule> {
+        let count_key = DataKey::VestingScheduleCount(vault_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let mut schedules: Vec<VestingSchedule> = Vec::new(&env);
+        for i in 0..count {
+            if let Some(schedule) = env.storage().persistent()
+                .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(vault_id, i))
+            {
+                schedules.push_back(schedule);
+            }
+        }
+        schedules
+    }
+
+    /// Returns the number of vesting schedules for a vault.
+    pub fn get_vesting_schedule_count(env: Env, vault_id: u64) -> u32 {
+        let count_key = DataKey::VestingScheduleCount(vault_id);
+        env.storage().persistent().get(&count_key).unwrap_or(0)
     }
 
     /// Sets a late-claim penalty for a vault's vesting schedule.
@@ -2167,6 +2188,7 @@ impl TtlVaultContract {
     pub fn set_vesting_penalty(
         env: Env,
         vault_id: u64,
+        schedule_index: u32,
         caller: Address,
         penalty_bps: u32,
         grace_period_seconds: u64,
@@ -2176,14 +2198,14 @@ impl TtlVaultContract {
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
-        if !env.storage().persistent().has(&DataKey::VestingSchedule(vault_id)) {
+        if !env.storage().persistent().has(&DataKey::VestingSchedule(vault_id, schedule_index)) {
             return Err(ContractError::VestingNotFound);
         }
         if penalty_bps == 0 || penalty_bps > 10_000 {
             return Err(ContractError::InvalidBps);
         }
         let config = VestingPenaltyConfig { penalty_bps, grace_period_seconds };
-        let key = DataKey::VestingPenalty(vault_id);
+        let key = DataKey::VestingPenalty(vault_id, schedule_index);
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage().persistent().set(&key, &config);
         env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
@@ -2192,26 +2214,27 @@ impl TtlVaultContract {
         Ok(())
     }
 
-    /// Returns the vesting penalty config for a vault, if one has been set.
-    pub fn get_vesting_penalty(env: Env, vault_id: u64) -> Option<VestingPenaltyConfig> {
-        env.storage().persistent().get(&DataKey::VestingPenalty(vault_id))
+    /// Returns the vesting penalty config for a specific schedule, if one has been set.
+    pub fn get_vesting_penalty(env: Env, vault_id: u64, schedule_index: u32) -> Option<VestingPenaltyConfig> {
+        env.storage().persistent().get(&DataKey::VestingPenalty(vault_id, schedule_index))
     }
 
     // --- Issue #548: Vesting Reversal ---
 
-    /// Initiates a reversible vesting claim, holding tokens in escrow for a grace period.
+    /// Initiates a reversible vesting claim for a specific schedule, holding tokens in escrow for a grace period.
     ///
     /// Unlike `claim_vested_installment` (which transfers immediately), this function
-    /// calculates the claimable amount and stores a `VestingPendingClaim` record without
-    /// transferring any tokens. The vault owner may call `reverse_vesting_claim` within
-    /// `reversal_window_seconds` to cancel. After the window, anyone may call
-    /// `finalize_vesting_claim` to complete the transfer.
+    /// calculates the claimable amount for the specified schedule and stores a
+    /// `VestingPendingClaim` record without transferring any tokens. The vault owner
+    /// may call `reverse_vesting_claim` within `reversal_window_seconds` to cancel.
+    /// After the window, anyone may call `finalize_vesting_claim` to complete the transfer.
     ///
-    /// Only one pending claim may exist per vault at a time; subsequent calls fail until
+    /// Only one pending claim may exist per schedule at a time; subsequent calls fail until
     /// the pending claim is finalized or reversed.
     ///
     /// # Arguments
     /// * `vault_id`               - The released vault with a vesting schedule
+    /// * `schedule_index`         - The index of the vesting schedule to claim from
     /// * `reversal_window_seconds`- Grace period in seconds (must be > 0)
     ///
     /// # Returns
@@ -2219,22 +2242,23 @@ impl TtlVaultContract {
     ///
     /// # Errors
     /// * `ContractError::Paused`              - Contract is paused
-    /// * `ContractError::VestingNotFound`     - No schedule on this vault
+    /// * `ContractError::VestingNotFound`     - No schedule at this index
     /// * `ContractError::NothingToClaimYet`   - No installments available
     /// * `ContractError::VestingAlreadyComplete` - All installments claimed
     /// * `ContractError::InvalidInterval`     - reversal_window_seconds is 0
-    /// * `ContractError::InvalidAmount`       - A pending claim already exists
+    /// * `ContractError::InvalidAmount`       - A pending claim already exists for this schedule
     pub fn initiate_vesting_claim(
         env: Env,
         vault_id: u64,
+        schedule_index: u32,
         reversal_window_seconds: u64,
     ) -> Result<i128, ContractError> {
         Self::assert_not_paused(&env);
         if reversal_window_seconds == 0 {
             return Err(ContractError::InvalidInterval);
         }
-        // Block if a pending claim already exists.
-        if env.storage().persistent().has(&DataKey::VestingPendingClaim(vault_id)) {
+        // Block if a pending claim already exists for this schedule.
+        if env.storage().persistent().has(&DataKey::VestingPendingClaim(vault_id, schedule_index)) {
             return Err(ContractError::InvalidAmount);
         }
 
@@ -2243,9 +2267,10 @@ impl TtlVaultContract {
             return Err(ContractError::AlreadyReleased);
         }
 
+        let sched_key = DataKey::VestingSchedule(vault_id, schedule_index);
         let mut schedule: VestingSchedule = env
             .storage().persistent()
-            .get(&DataKey::VestingSchedule(vault_id))
+            .get(&sched_key)
             .ok_or(ContractError::VestingNotFound)?;
 
         if schedule.claimed_installments >= schedule.num_installments {
@@ -2283,7 +2308,6 @@ impl TtlVaultContract {
         // Advance the schedule counter so a second call is blocked until this claim
         // is finalized or reversed.
         schedule.claimed_installments = unlocked;
-        let sched_key = DataKey::VestingSchedule(vault_id);
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage().persistent().set(&sched_key, &schedule);
         env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
@@ -2296,25 +2320,26 @@ impl TtlVaultContract {
             new_installments_claimed: unlocked,
             prev_installments_claimed,
         };
-        let pk = DataKey::VestingPendingClaim(vault_id);
+        let pk = DataKey::VestingPendingClaim(vault_id, schedule_index);
         env.storage().persistent().set(&pk, &pending);
         env.storage().persistent().extend_ttl(&pk, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(amount)
     }
 
-    /// Reverses a pending vesting claim within the reversal window.
+    /// Reverses a pending vesting claim for a specific schedule within the reversal window.
     ///
     /// Only the vault owner may call this. The pending claim record is cleared and
     /// the schedule counter is rolled back so the installments become claimable again.
     ///
     /// # Errors
     /// * `ContractError::NotOwner`            - Caller is not the vault owner
-    /// * `ContractError::VestingReversalNotFound` - No pending claim on this vault
+    /// * `ContractError::VestingReversalNotFound` - No pending claim on this schedule
     /// * `ContractError::VestingReversalExpired`  - Reversal window has closed
     pub fn reverse_vesting_claim(
         env: Env,
         vault_id: u64,
+        schedule_index: u32,
         caller: Address,
     ) -> Result<(), ContractError> {
         caller.require_auth();
@@ -2323,7 +2348,7 @@ impl TtlVaultContract {
             return Err(ContractError::NotOwner);
         }
 
-        let pk = DataKey::VestingPendingClaim(vault_id);
+        let pk = DataKey::VestingPendingClaim(vault_id, schedule_index);
         let pending: VestingPendingClaim = env
             .storage().persistent()
             .get(&pk)
@@ -2335,7 +2360,7 @@ impl TtlVaultContract {
         }
 
         // Roll back the schedule counter so these installments can be claimed again.
-        let sched_key = DataKey::VestingSchedule(vault_id);
+        let sched_key = DataKey::VestingSchedule(vault_id, schedule_index);
         if let Some(mut schedule) = env.storage().persistent()
             .get::<DataKey, VestingSchedule>(&sched_key)
         {
@@ -2351,18 +2376,18 @@ impl TtlVaultContract {
         Ok(())
     }
 
-    /// Finalizes a pending vesting claim after the reversal window has closed.
+    /// Finalizes a pending vesting claim for a specific schedule after the reversal window has closed.
     ///
     /// Anyone may call this. Transfers the escrowed amount to the beneficiary and
     /// clears the pending claim record.
     ///
     /// # Errors
-    /// * `ContractError::VestingReversalNotFound` - No pending claim on this vault
+    /// * `ContractError::VestingReversalNotFound` - No pending claim on this schedule
     /// * `ContractError::InvalidInterval`         - Reversal window has not yet closed
-    pub fn finalize_vesting_claim(env: Env, vault_id: u64) -> Result<i128, ContractError> {
+    pub fn finalize_vesting_claim(env: Env, vault_id: u64, schedule_index: u32) -> Result<i128, ContractError> {
         Self::assert_not_paused(&env);
 
-        let pk = DataKey::VestingPendingClaim(vault_id);
+        let pk = DataKey::VestingPendingClaim(vault_id, schedule_index);
         let pending: VestingPendingClaim = env
             .storage().persistent()
             .get(&pk)
@@ -2393,16 +2418,17 @@ impl TtlVaultContract {
         Ok(pending.amount)
     }
 
-    /// Returns the pending vesting claim for a vault, if one exists.
-    pub fn get_pending_vesting_claim(env: Env, vault_id: u64) -> Option<VestingPendingClaim> {
-        env.storage().persistent().get(&DataKey::VestingPendingClaim(vault_id))
+    /// Returns the pending vesting claim for a specific schedule, if one exists.
+    pub fn get_pending_vesting_claim(env: Env, vault_id: u64, schedule_index: u32) -> Option<VestingPendingClaim> {
+        env.storage().persistent().get(&DataKey::VestingPendingClaim(vault_id, schedule_index))
     }
 
-    /// Claims all vested installments that have become available since the last claim.
+    /// Claims all vested installments that have become available since the last claim
+    /// across all vesting schedules on the vault.
     ///
-    /// The vault must have been released (trigger_release called) and a vesting schedule
-    /// must be attached. The beneficiary (or any caller) can invoke this once the vault
-    /// is Released and at least one installment window has elapsed since `start_time`.
+    /// The vault must have been released (trigger_release called) and at least one vesting
+    /// schedule must be attached. Any caller can invoke this once the vault is Released
+    /// and at least one installment window has elapsed on any schedule.
     ///
     /// Funds are distributed to the primary beneficiary, or split among multi-beneficiaries
     /// using the same BPS logic as `trigger_release`.
@@ -2418,7 +2444,6 @@ impl TtlVaultContract {
     /// * `ContractError::Paused` - If the contract is paused
     /// * `ContractError::VestingNotFound` - If no vesting schedule exists
     /// * `ContractError::NothingToClaimYet` - If no new installments are available
-    /// * `ContractError::VestingAlreadyComplete` - If all installments have been claimed
     /// * `ContractError::InsufficientBalance` - If vault balance is insufficient
     pub fn claim_vested_installment(env: Env, vault_id: u64) -> Result<i128, ContractError> {
         Self::assert_not_paused(&env);
@@ -2429,103 +2454,120 @@ impl TtlVaultContract {
             return Err(ContractError::AlreadyReleased);
         }
 
-        let mut schedule: VestingSchedule = env
-            .storage()
-            .persistent()
-            .get(&DataKey::VestingSchedule(vault_id))
-            .ok_or(ContractError::VestingNotFound)?;
-
-        if schedule.claimed_installments >= schedule.num_installments {
-            return Err(ContractError::VestingAlreadyComplete);
+        let count_key = DataKey::VestingScheduleCount(vault_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count == 0 {
+            return Err(ContractError::VestingNotFound);
         }
 
         let now = env.ledger().timestamp();
-        if now < schedule.start_time {
-            return Err(ContractError::NothingToClaimYet);
-        }
+        let mut total_claimable: i128 = 0;
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        let mut any_cliff_reached = false;
 
-        // Enforce cliff: no claims until start_time + cliff_period has elapsed
-        if schedule.cliff_period > 0 && now < schedule.start_time + schedule.cliff_period {
-            return Err(ContractError::CliffNotReached);
-        }
-
-        // Emit cliff reached event on the first claim after cliff (cliff_period > 0 and no prior claims)
-        let cliff_just_reached = schedule.cliff_period > 0 && schedule.claimed_installments == 0;
-        if cliff_just_reached {
-            env.events().publish((CLIFF_REACHED_TOPIC, vault_id), (now,));
-        }
-
-        // How many installments are unlocked so far?
-        let elapsed = now - schedule.start_time;
-        let unlocked = ((elapsed / schedule.interval) + 1).min(schedule.num_installments as u64) as u32;
-        let claimable = unlocked.saturating_sub(schedule.claimed_installments);
-        if claimable == 0 {
-            return Err(ContractError::NothingToClaimYet);
-        }
-
-        // Calculate payout: each installment = total / num_installments,
-        // last installment absorbs remainder.
-        let per_installment = schedule.total_amount / schedule.num_installments as i128;
-        let base_amount = if unlocked >= schedule.num_installments {
-            vault.balance
-        } else {
-            per_installment * claimable as i128
-        };
-
-        // Issue #547: apply late-claim penalty to installments claimed after grace period.
-        let amount = if let Some(penalty_cfg) = env.storage().persistent()
-            .get::<DataKey, VestingPenaltyConfig>(&DataKey::VestingPenalty(vault_id))
-        {
-            // Count how many of the claimable installments are "late".
-            // Installment i (1-based) unlocks at start_time + (i-1)*interval.
-            let late_cutoff = now.saturating_sub(penalty_cfg.grace_period_seconds);
-            let mut late_count = 0u32;
-            for i in (schedule.claimed_installments + 1)..=unlocked {
-                let unlock_time = schedule.start_time
-                    .saturating_add((i as u64 - 1).saturating_mul(schedule.interval));
-                if unlock_time < late_cutoff {
-                    late_count += 1;
+        // First pass: calculate total claimable amount across all schedules
+        for i in 0..count {
+            let sched_key = DataKey::VestingSchedule(vault_id, i);
+            if let Some(schedule) = env.storage().persistent().get::<DataKey, VestingSchedule>(&sched_key) {
+                if schedule.claimed_installments >= schedule.num_installments {
+                    continue;
                 }
-            }
-            if late_count > 0 {
-                let on_time_count = claimable.saturating_sub(late_count);
-                let on_time_amount = per_installment * on_time_count as i128;
-                let late_amount = per_installment * late_count as i128;
-                let penalty = late_amount * penalty_cfg.penalty_bps as i128 / 10_000;
-                let penalized = on_time_amount + late_amount - penalty;
-                // For the final batch keep vault.balance as ceiling to avoid dust mismatch.
-                if unlocked >= schedule.num_installments {
-                    penalized.min(vault.balance)
+                if now < schedule.start_time {
+                    continue;
+                }
+
+                // Enforce cliff: no claims until start_time + cliff_period has elapsed
+                if schedule.cliff_period > 0 && now < schedule.start_time + schedule.cliff_period {
+                    continue;
+                }
+
+                if schedule.cliff_period > 0 && schedule.claimed_installments == 0 {
+                    any_cliff_reached = true;
+                }
+
+                // How many installments are unlocked so far?
+                let elapsed = now - schedule.start_time;
+                let unlocked = ((elapsed / schedule.interval) + 1)
+                    .min(schedule.num_installments as u64) as u32;
+                let claimable = unlocked.saturating_sub(schedule.claimed_installments);
+                if claimable == 0 {
+                    continue;
+                }
+
+                // Calculate payout: each installment = total / num_installments,
+                // last installment absorbs remainder.
+                let per_installment = schedule.total_amount / schedule.num_installments as i128;
+                let base_amount = if unlocked >= schedule.num_installments {
+                    vault.balance - total_claimable
                 } else {
-                    penalized
-                }
-            } else {
-                base_amount
-            }
-        } else {
-            base_amount
-        };
+                    per_installment * claimable as i128
+                };
 
-        if vault.balance < amount {
+                // Apply late-claim penalty per schedule
+                let schedule_amount = if let Some(penalty_cfg) = env.storage().persistent()
+                    .get::<DataKey, VestingPenaltyConfig>(&DataKey::VestingPenalty(vault_id, i))
+                {
+                    let late_cutoff = now.saturating_sub(penalty_cfg.grace_period_seconds);
+                    let mut late_count = 0u32;
+                    for j in (schedule.claimed_installments + 1)..=unlocked {
+                        let unlock_time = schedule.start_time
+                            .saturating_add((j as u64 - 1).saturating_mul(schedule.interval));
+                        if unlock_time < late_cutoff {
+                            late_count += 1;
+                        }
+                    }
+                    if late_count > 0 {
+                        let on_time_count = claimable.saturating_sub(late_count);
+                        let on_time_amount = per_installment * on_time_count as i128;
+                        let late_amount = per_installment * late_count as i128;
+                        let penalty = late_amount * penalty_cfg.penalty_bps as i128 / 10_000;
+                        let penalized = on_time_amount + late_amount - penalty;
+                        if unlocked >= schedule.num_installments {
+                            penalized.min(vault.balance - total_claimable)
+                        } else {
+                            penalized
+                        }
+                    } else {
+                        base_amount
+                    }
+                } else {
+                    base_amount
+                };
+
+                total_claimable += schedule_amount;
+            }
+        }
+
+        if total_claimable == 0 {
+            return Err(ContractError::NothingToClaimYet);
+        }
+
+        if vault.balance < total_claimable {
             return Err(ContractError::InsufficientBalance);
+        }
+
+        // Emit cliff reached event if any schedule just reached its cliff
+        if any_cliff_reached {
+            env.events().publish((CLIFF_REACHED_TOPIC, vault_id), (now,));
         }
 
         let token_client = token::Client::new(&env, &vault.token_address);
 
+        // Distribute to beneficiaries
         if vault.beneficiaries.is_empty() {
-            token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &amount);
+            token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &total_claimable);
             env.events().publish(
                 (CLAIM_VEST_TOPIC, vault_id),
-                (vault.beneficiary.clone(), amount, unlocked),
+                (vault.beneficiary.clone(), total_claimable, 0u32),
             );
         } else {
             let mut distributed: i128 = 0;
             let last_idx = vault.beneficiaries.len() - 1;
             for (i, entry) in vault.beneficiaries.iter().enumerate() {
                 let share = if i as u32 == last_idx {
-                    amount - distributed
+                    total_claimable - distributed
                 } else {
-                    amount * (entry.bps as i128) / 10_000
+                    total_claimable * (entry.bps as i128) / 10_000
                 };
                 if share > 0 {
                     token_client.transfer(&env.current_contract_address(), &entry.address, &share);
@@ -2533,29 +2575,41 @@ impl TtlVaultContract {
                 distributed += share;
                 env.events().publish(
                     (CLAIM_VEST_TOPIC, vault_id),
-                    (entry.address.clone(), share, unlocked),
+                    (entry.address.clone(), share, 0u32),
                 );
             }
         }
 
-        vault.balance -= amount;
-        schedule.claimed_installments = unlocked;
+        vault.balance -= total_claimable;
         Self::save_vault(&env, vault_id, &vault);
 
-        // Emit penalty event if the payout was reduced.
-        if amount < base_amount {
-            env.events().publish(
-                (VESTING_PENALTY_TOPIC, vault_id),
-                (base_amount - amount, amount),
-            );
+        // Second pass: update all schedules' claimed_installments
+        for i in 0..count {
+            let sched_key = DataKey::VestingSchedule(vault_id, i);
+            if let Some(schedule) = env.storage().persistent().get::<DataKey, VestingSchedule>(&sched_key) {
+                if schedule.claimed_installments >= schedule.num_installments {
+                    continue;
+                }
+                if now < schedule.start_time {
+                    continue;
+                }
+                if schedule.cliff_period > 0 && now < schedule.start_time + schedule.cliff_period {
+                    continue;
+                }
+
+                let elapsed = now - schedule.start_time;
+                let unlocked = ((elapsed / schedule.interval) + 1)
+                    .min(schedule.num_installments as u64) as u32;
+
+                let mut updated = schedule.clone();
+                updated.claimed_installments = unlocked;
+                env.storage().persistent().set(&sched_key, &updated);
+                env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
+            }
         }
 
-        let sched_key = DataKey::VestingSchedule(vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().set(&sched_key, &schedule);
-        env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        Ok(amount)
+        Ok(total_claimable)
     }
 
     /// Allows the vault owner to claw back unvested funds from a released vault.
@@ -2693,7 +2747,7 @@ impl TtlVaultContract {
             return Err(ContractError::EmptyVault);
         }
         // Cannot have both time-based and milestone-based vesting
-        if env.storage().persistent().has(&DataKey::VestingSchedule(vault_id)) {
+        if env.storage().persistent().get::<DataKey, u32>(&DataKey::VestingScheduleCount(vault_id)).unwrap_or(0) > 0 {
             return Err(ContractError::AlreadyReleased);
         }
         if milestones.is_empty() {
